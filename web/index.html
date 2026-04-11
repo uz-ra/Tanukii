@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tanukii</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="topLogoWrap">
+      <img id="topLogo" class="topLogo" src="/Tanukii.png" alt="Tanukii ロゴ" />
+    </div>
+
+    <button id="sidebarToggleBtn" class="sidebarToggleBtn" type="button" aria-label="メニューを開閉">
+      ☰
+    </button>
+    <div id="sidebarBackdrop" class="sidebarBackdrop"></div>
+
+    <main class="container appShell">
+      <aside class="sidebar card">
+        <h1>Tanukii</h1>
+        <p class="lead">メニュー</p>
+        <nav class="menu">
+          <button class="menuBtn" data-view="transcribeView" id="menuTranscribe">文字起こし</button>
+          <button class="menuBtn" data-view="summarizeView" id="menuSummarize">要約</button>
+          <button class="menuBtn" data-view="debugView" id="menuDebug">デバッグ情報</button>
+          <button class="menuBtn" data-view="settingsView" id="menuSettings">設定</button>
+        </nav>
+      </aside>
+
+      <section class="contentArea">
+        <section class="view card" id="transcribeView">
+          <h2>文字起こし</h2>
+          <label class="label" for="audio">音声ファイル</label>
+          <input id="audio" type="file" accept="audio/*" />
+
+          <label class="label" for="language">言語コード</label>
+          <input id="language" type="text" value="ja" />
+
+          <button id="transcribeBtn">文字起こし開始</button>
+
+          <label class="label" for="transcript">文字起こし結果</label>
+          <textarea id="transcript" rows="12" placeholder="ここに文字起こし結果が表示されます"></textarea>
+
+          <div class="buttonRow">
+            <button id="copyTranscriptBtn" type="button">結果をコピー</button>
+            <button id="downloadTranscriptBtn" type="button">結果を保存</button>
+          </div>
+
+          <button id="goToSummarizeBtn" type="button">この結果で要約へ進む</button>
+        </section>
+
+        <section class="view card" id="summarizeView">
+          <h2>要約</h2>
+          <label class="label" for="style">要約スタイル</label>
+          <select id="style">
+            <option value="bullets">箇条書き</option>
+            <option value="minutes">議事録</option>
+            <option value="actions">アクション抽出</option>
+          </select>
+
+          <label class="label" for="summaryInput">要約対象テキスト</label>
+          <textarea id="summaryInput" rows="10" placeholder="文字起こし結果をここに反映します"></textarea>
+
+          <button id="summarizeBtn">要約作成</button>
+
+          <label class="label" for="summary">要約結果</label>
+          <textarea id="summary" rows="10" placeholder="ここに要約が表示されます"></textarea>
+
+          <div class="buttonRow">
+            <button id="copySummaryBtn" type="button">要約をコピー</button>
+            <button id="downloadSummaryBtn" type="button">要約を保存</button>
+          </div>
+        </section>
+
+        <section class="view card" id="debugView">
+          <h2>デバッグ情報</h2>
+          <div class="buttonRow">
+            <button id="refreshLogsBtn" type="button">ログ更新</button>
+            <button id="copyLogsBtn" type="button">ログをコピー</button>
+          </div>
+          <button id="clearLogsBtn" type="button">ログクリア</button>
+          <textarea id="debugLog" rows="18" readonly placeholder="ここにデバッグログが表示されます"></textarea>
+        </section>
+
+        <section class="view card" id="settingsView">
+          <h2>設定</h2>
+
+          <label class="label" for="whisperModel">Whisperモデル</label>
+          <select id="whisperModel">
+            <option value="tiny">tiny (最速)</option>
+            <option value="base">base</option>
+            <option value="small" selected>small</option>
+            <option value="medium">medium</option>
+            <option value="large">large (高精度)</option>
+          </select>
+
+          <label class="label" for="provider">要約プロバイダ</label>
+          <select id="provider">
+            <option value="auto">自動選択</option>
+            <option value="gemini">Gemini</option>
+            <option value="openai">OpenAI</option>
+            <option value="local">ローカル簡易</option>
+          </select>
+
+          <div id="geminiFields" class="providerFields">
+            <label class="label" for="geminiModel">Geminiモデル</label>
+            <input id="geminiModel" type="text" placeholder="例: gemini-2.0-flash" />
+            <label class="label" for="geminiApiKey">Gemini APIキー</label>
+            <input id="geminiApiKey" type="password" placeholder="configに保存する場合は入力" />
+          </div>
+
+          <div id="openaiFields" class="providerFields">
+            <label class="label" for="openaiModel">OpenAIモデル</label>
+            <input id="openaiModel" type="text" placeholder="例: gpt-4.1-mini" />
+            <label class="label" for="openaiApiKey">OpenAI APIキー</label>
+            <input id="openaiApiKey" type="password" placeholder="configに保存する場合は入力" />
+          </div>
+
+          <label class="checkboxLine">
+            <input id="debugModeSetting" type="checkbox" />
+            デバッグモードを有効化
+          </label>
+
+          <div id="debugPromptEditors" class="debugPromptEditors">
+            <label class="label" for="summarySystemPrompt">要約System Prompt</label>
+            <textarea id="summarySystemPrompt" rows="5" placeholder="system prompt"></textarea>
+            <label class="label" for="summaryUserPromptTemplate">要約User Prompt Template</label>
+            <textarea id="summaryUserPromptTemplate" rows="6" placeholder="{style_instruction}\n\n対象テキスト:\n{text}"></textarea>
+          </div>
+
+          <div class="buttonRow">
+            <button id="loadConfigBtn" type="button">設定を読込</button>
+            <button id="saveConfigBtn" type="button">設定を保存</button>
+          </div>
+        </section>
+
+        <p id="status" class="status">待機中</p>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
