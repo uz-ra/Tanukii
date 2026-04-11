@@ -384,19 +384,12 @@ async function downloadTextResult(text, filename, emptyMessage) {
     setStatus(emptyMessage);
     return;
   }
-
-  const input = window.prompt("保存するファイル名を入力してください。", filename);
-  if (input === null) {
-    setStatus("保存をキャンセルしました。");
-    return;
-  }
-
-  const selectedFilename = sanitizeFilename(input, filename);
+  const selectedFilename = sanitizeFilename(filename, filename);
 
   try {
     const savedWithPicker = await saveTextWithPicker(text, selectedFilename);
     if (savedWithPicker) {
-      setStatus("保存先とファイル名を指定して保存しました。");
+      setStatus("保存先を選択して保存しました。");
       return;
     }
 
@@ -407,7 +400,7 @@ async function downloadTextResult(text, filename, emptyMessage) {
     anchor.download = selectedFilename;
     anchor.click();
     URL.revokeObjectURL(url);
-    setStatus("ファイル名を指定して保存しました。");
+    setStatus("既定のファイル名で保存しました。");
   } catch (error) {
     if (error && error.name === "AbortError") {
       setStatus("保存をキャンセルしました。");
