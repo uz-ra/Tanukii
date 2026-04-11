@@ -8,8 +8,8 @@
 
 - バックエンド: FastAPI
 - 文字起こし: faster-whisper
-- 要約: local / Gemini / OpenAI（設定で切替）
-- フロントエンド: 静的 HTML/CSS/JavaScript
+- 要約: local / Gemini / OpenAI（設定で切替、API設定）
+- フロントエンド: HTML/CSS/JavaScript
 
 ## セットアップ
 
@@ -47,9 +47,9 @@
 - サンプル環境変数: [.env.example](.env.example)
 - 実行時設定保存先: [config/settings.json](config/settings.json) (Git 管理対象外)
 
-## 配布時の注意
+## 導入時の注意
 
-- `models/` は容量が大きいため、初回実行時ダウンロード方式を前提にしています。
+- `models/` は容量が大きいため、初回実行時のダウンロードを前提に同梱していません。
 
 ## セキュリティ
 
