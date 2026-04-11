@@ -4,7 +4,10 @@
 
 ローカル実行向けの、音声文字起こし + 要約 Web アプリです。
 
-## 概要
+## スクリーンショット
+![demo](demo.gif)
+
+## 構成
 
 - バックエンド: FastAPI
 - 文字起こし: faster-whisper
@@ -36,11 +39,15 @@
 
 - `GET /api/health`
 - `POST /api/transcribe` (multipart: file, language, model)
+- `POST /api/transcribe/start` (multipart: file, language, model)
+- `GET /api/transcribe/jobs/{job_id}`
 - `POST /api/summarize` (multipart: text, style, provider, model, api_key, system_prompt, user_prompt_template)
 - `GET /api/config`
 - `POST /api/config`
 - `GET /api/debug/logs`
 - `POST /api/debug/logs/clear`
+
+`/api/transcribe/jobs/{job_id}` は、進捗率（0-100）を `progress` として返します。値は「確定済みセグメントの終了時刻 / 音声長」を使った擬似進捗です。
 
 ## 設定ファイル
 

@@ -72,3 +72,9 @@ curl -s http://127.0.0.1:8000/api/health
 
 画面の「設定を保存」で設定値は `config/settings.json` に保存されます。
 このファイルはローカル情報を含むため Git 管理対象外です。
+
+## 9. Tips
+音声文字起こしのモデルを最初でダウンロードしておきたいときは
+
+
+```.venv/bin/python -c "from faster_whisper import WhisperModel; [WhisperModel(m, download_root='models', compute_type='int8') for m in ['tiny','base','small','medium','large']]"```

@@ -40,6 +40,14 @@
 
           <button id="transcribeBtn">文字起こし開始</button>
 
+          <div id="transcribeProgressWrap" class="progressWrap" hidden>
+            <div class="progressHead">
+              <span>進捗</span>
+              <span id="transcribeProgressText">0%</span>
+            </div>
+            <progress id="transcribeProgress" max="100" value="0"></progress>
+          </div>
+
           <label class="label" for="transcript">文字起こし結果</label>
           <textarea id="transcript" rows="12" placeholder="ここに文字起こし結果が表示されます"></textarea>
 

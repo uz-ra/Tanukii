@@ -3,8 +3,10 @@ import tempfile
 import json
 import time
 import shutil
+import threading
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 import requests
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -72,6 +74,9 @@ app.add_middleware(
 _whisper_models: dict[str, WhisperModel] = {}
 _debug_logs: list[dict] = []
 _DEBUG_LOG_LIMIT = 300
+_transcribe_jobs: dict[str, dict] = {}
+_transcribe_jobs_lock = threading.Lock()
+_TRANSCRIBE_JOB_LIMIT = 100
 
 
 def add_debug_log(level: str, message: str) -> None:
@@ -83,6 +88,120 @@ def add_debug_log(level: str, message: str) -> None:
     _debug_logs.append(entry)
     if len(_debug_logs) > _DEBUG_LOG_LIMIT:
         del _debug_logs[: len(_debug_logs) - _DEBUG_LOG_LIMIT]
+
+
+def update_transcribe_job(job_id: str, **fields) -> None:
+    with _transcribe_jobs_lock:
+        job = _transcribe_jobs.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated_at"] = time.time()
+
+
+def create_transcribe_job(selected_model: str, language: str, filename: str) -> str:
+    job_id = str(uuid4())
+    now = time.time()
+    with _transcribe_jobs_lock:
+        if len(_transcribe_jobs) >= _TRANSCRIBE_JOB_LIMIT:
+            oldest = sorted(_transcribe_jobs.items(), key=lambda item: item[1].get("updated_at", 0.0))
+            for old_job_id, _ in oldest[: max(1, len(_transcribe_jobs) - _TRANSCRIBE_JOB_LIMIT + 1)]:
+                _transcribe_jobs.pop(old_job_id, None)
+
+        _transcribe_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "キューに登録しました。",
+            "model": selected_model,
+            "language": language,
+            "filename": filename,
+            "result": None,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+    return job_id
+
+
+def get_transcribe_job(job_id: str) -> Optional[dict]:
+    with _transcribe_jobs_lock:
+        job = _transcribe_jobs.get(job_id)
+        if not job:
+            return None
+        return dict(job)
+
+
+def run_transcribe_job(job_id: str, tmp_path: str, selected_model: str, language: str) -> None:
+    update_transcribe_job(job_id, status="running", message="モデルを読み込み中です。", progress=1)
+
+    try:
+        add_debug_log("debug", f"job={job_id} loading whisper model")
+        whisper_model = get_whisper_model(selected_model)
+        update_transcribe_job(job_id, message="文字起こしを開始しました。", progress=2)
+
+        segments, info = whisper_model.transcribe(tmp_path, language=language, vad_filter=True)
+        total_duration = float(info.duration or 0.0)
+
+        transcript_parts = []
+        timed_segments = []
+        for seg in segments:
+            text = seg.text.strip()
+            if not text:
+                continue
+
+            transcript_parts.append(text)
+            timed_segments.append(
+                {
+                    "start": round(seg.start, 2),
+                    "end": round(seg.end, 2),
+                    "text": text,
+                }
+            )
+
+            if total_duration > 0:
+                ratio = max(0.0, min(1.0, float(seg.end) / total_duration))
+                progress = min(99, max(2, int(ratio * 100)))
+            else:
+                progress = min(99, max(2, 2 + len(timed_segments)))
+
+            update_transcribe_job(job_id, progress=progress, message=f"文字起こし中... {progress}%")
+
+        transcript = "\n".join(transcript_parts)
+        result = {
+            "model": selected_model,
+            "language": info.language,
+            "duration": round(info.duration, 2) if info.duration else None,
+            "text": transcript,
+            "segments": timed_segments,
+        }
+
+        update_transcribe_job(
+            job_id,
+            status="completed",
+            progress=100,
+            message="文字起こしが完了しました。",
+            result=result,
+            error=None,
+        )
+        add_debug_log(
+            "info",
+            f"transcribe done: job={job_id}, language={info.language}, segments={len(timed_segments)}, chars={len(transcript)}",
+        )
+    except Exception as exc:
+        update_transcribe_job(
+            job_id,
+            status="failed",
+            message="文字起こしに失敗しました。",
+            error=str(exc),
+        )
+        add_debug_log("error", f"transcribe failed: job={job_id}, error={str(exc)}")
+    finally:
+        try:
+            os.remove(tmp_path)
+            add_debug_log("debug", f"temporary file removed: {tmp_path}")
+        except OSError:
+            pass
 
 
 class AppConfigPayload(BaseModel):
@@ -452,6 +571,80 @@ async def transcribe_audio(
             add_debug_log("debug", f"temporary file removed: {tmp_path}")
         except OSError:
             pass
+
+
+@app.post("/api/transcribe/start")
+async def start_transcribe_job(
+    file: UploadFile = File(...),
+    language: str = Form("ja"),
+    model: str = Form(""),
+) -> JSONResponse:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="ファイル名が不正です。")
+
+    if not ffmpeg_available():
+        add_debug_log("error", "ffmpeg not found")
+        raise HTTPException(status_code=503, detail="FFmpeg が見つかりません。インストール後に再実行してください。")
+
+    cfg = read_config()
+    selected_model = (model or cfg.get("whisper_model") or WHISPER_MODEL_NAME).strip().lower()
+    if selected_model not in AVAILABLE_WHISPER_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Whisperモデルは {', '.join(AVAILABLE_WHISPER_MODELS)} から選択してください。",
+        )
+
+    suffix = Path(file.filename).suffix or ".tmp"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    job_id = create_transcribe_job(selected_model=selected_model, language=language, filename=file.filename)
+    add_debug_log(
+        "info",
+        f"transcribe start: job={job_id}, file={file.filename}, language={language}, model={selected_model}",
+    )
+    add_debug_log("debug", f"temporary file created: {tmp_path}, bytes={len(content)}")
+
+    thread = threading.Thread(
+        target=run_transcribe_job,
+        args=(job_id, tmp_path, selected_model, language),
+        daemon=True,
+    )
+    thread.start()
+
+    return JSONResponse(
+        {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "文字起こしジョブを開始しました。",
+        }
+    )
+
+
+@app.get("/api/transcribe/jobs/{job_id}")
+def get_transcribe_job_status(job_id: str) -> JSONResponse:
+    job = get_transcribe_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="ジョブが見つかりません。")
+
+    response = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "message": job.get("message", ""),
+        "model": job.get("model"),
+        "language": job.get("language"),
+    }
+
+    if job["status"] == "completed":
+        response["result"] = job.get("result")
+    if job["status"] == "failed":
+        response["error"] = job.get("error") or "unknown error"
+
+    return JSONResponse(response)
 
 
 @app.post("/api/summarize")

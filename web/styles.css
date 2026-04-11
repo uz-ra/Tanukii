@@ -1,5 +1,5 @@
 :root {
-  --bg: #f4fffc;
+  --bg: #f7f7f7;
   --ink: #163247;
   --card: #ffffff;
   --line: #b6e4b3;
@@ -23,7 +23,7 @@ body {
   margin: 0;
   font-family: "Hiragino Sans", "Yu Gothic", sans-serif;
   color: var(--ink);
-  background: radial-gradient(circle at top right, #d9eeff 0%, var(--bg) 50%, #eef7ff 100%);
+  background: radial-gradient(circle at top right, #f1f1f1 0%, var(--bg) 70%, #f7fff9 100%);
 }
 
 .topLogoWrap {
@@ -280,6 +280,28 @@ body.debug-active .debugPromptEditors {
 button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.progressWrap {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+}
+
+.progressHead {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.92rem;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+#transcribeProgress {
+  width: 100%;
+  height: 11px;
 }
 
 .status {

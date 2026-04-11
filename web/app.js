@@ -31,6 +31,9 @@ const summaryEl = document.getElementById("summary");
 const debugLogEl = document.getElementById("debugLog");
 const statusEl = document.getElementById("status");
 const topLogoEl = document.getElementById("topLogo");
+const transcribeProgressWrapEl = document.getElementById("transcribeProgressWrap");
+const transcribeProgressEl = document.getElementById("transcribeProgress");
+const transcribeProgressTextEl = document.getElementById("transcribeProgressText");
 
 const defaultLogoPath = "/Tanukii.png";
 const debugLogoPath = "/Tanukii-Light.png";
@@ -52,6 +55,8 @@ function setStatus(message) {
     return;
   }
 
+  statusEl.style.display = "none";
+
   let level = "info";
   if (/失敗|エラー|不正|空です|ありません|選択してください/.test(text)) {
     level = "error";
@@ -60,6 +65,56 @@ function setStatus(message) {
   }
 
   addLocalLog(level, text);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function setTranscribeProgress(percent, visible = true) {
+  const value = Number.isFinite(percent) ? Math.max(0, Math.min(100, Math.round(percent))) : 0;
+  transcribeProgressEl.value = value;
+  transcribeProgressTextEl.textContent = `${value}%`;
+  transcribeProgressWrapEl.hidden = !visible;
+}
+
+async function waitForTranscribeJob(jobId, timeoutMs = 600000) {
+  const startedAt = Date.now();
+
+  while (true) {
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error("進捗待機がタイムアウトしました。");
+    }
+
+    const response = await fetchWithTimeout(`/api/transcribe/jobs/${encodeURIComponent(jobId)}`, {}, 15000);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`HTTP ${response.status} ${errorText}`);
+    }
+
+    const job = await response.json();
+    const progress = Number.isFinite(job.progress) ? job.progress : 0;
+    setTranscribeProgress(progress, true);
+
+    if (job.status === "completed") {
+      setTranscribeProgress(100, true);
+      return job.result || {};
+    }
+
+    if (job.status === "failed") {
+      throw new Error(job.error || "文字起こしに失敗しました。");
+    }
+
+    if (job.status === "queued") {
+      setStatus("文字起こしキュー待機中...");
+    } else {
+      setStatus(`文字起こし中... ${Math.round(progress)}%`);
+    }
+
+    await sleep(700);
+  }
 }
 
 function addLocalLog(level, message) {
@@ -265,19 +320,81 @@ async function copyTextResult(text, successMessage, emptyMessage) {
   }
 }
 
-function downloadTextResult(text, filename, emptyMessage) {
+function sanitizeFilename(filename, fallbackName) {
+  const trimmed = String(filename || "").trim();
+  if (!trimmed) {
+    return fallbackName;
+  }
+
+  const normalized = trimmed
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return normalized || fallbackName;
+}
+
+async function saveTextWithPicker(text, filename) {
+  if (typeof window.showSaveFilePicker !== "function") {
+    return false;
+  }
+
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const handle = await window.showSaveFilePicker({
+    suggestedName: filename,
+    types: [
+      {
+        description: "Text",
+        accept: {
+          "text/plain": [".txt"],
+        },
+      },
+    ],
+  });
+
+  const writable = await handle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+  return true;
+}
+
+async function downloadTextResult(text, filename, emptyMessage) {
   if (!text.trim()) {
     setStatus(emptyMessage);
     return;
   }
-  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
-  setStatus("ファイルを保存しました。");
+
+  const input = window.prompt("保存するファイル名を入力してください。", filename);
+  if (input === null) {
+    setStatus("保存をキャンセルしました。");
+    return;
+  }
+
+  const selectedFilename = sanitizeFilename(input, filename);
+
+  try {
+    const savedWithPicker = await saveTextWithPicker(text, selectedFilename);
+    if (savedWithPicker) {
+      setStatus("保存先とファイル名を指定して保存しました。");
+      return;
+    }
+
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = selectedFilename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setStatus("ファイル名を指定して保存しました。");
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      setStatus("保存をキャンセルしました。");
+      return;
+    }
+    console.error(error);
+    setStatus("保存に失敗しました。");
+  }
 }
 
 function forwardToSummarize() {
@@ -302,22 +419,29 @@ async function transcribe() {
   formData.append("language", languageInput.value || "ja");
   formData.append("model", whisperModelInput.value || "small");
 
-  setStatus("文字起こしを実行中...");
+  setTranscribeProgress(0, true);
+  setStatus("文字起こしジョブを開始します...");
   logDebug("info", `transcribe requested: file=${file.name}, model=${whisperModelInput.value}`);
   transcribeBtn.disabled = true;
 
   try {
     const response = await fetchWithTimeout(
-      "/api/transcribe",
+      "/api/transcribe/start",
       { method: "POST", body: formData },
-      600000
+      60000
     );
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(`HTTP ${response.status} ${errorText}`);
     }
 
-    const data = await response.json();
+    const started = await response.json();
+    if (!started.job_id) {
+      throw new Error("job_id が返されませんでした。");
+    }
+
+    logDebug("info", `transcribe job started: job=${started.job_id}`);
+    const data = await waitForTranscribeJob(started.job_id, 600000);
     transcriptEl.value = data.text || "";
     summaryInputEl.value = data.text || "";
     logDebug("info", `transcribe done: chars=${(data.text || "").length}`);
@@ -325,6 +449,7 @@ async function transcribe() {
   } catch (error) {
     console.error(error);
     logDebug("error", `transcribe failed: ${error.message}`);
+    setTranscribeProgress(0, false);
     setStatus("文字起こしに失敗しました。");
   } finally {
     transcribeBtn.disabled = false;
