@@ -4,6 +4,7 @@ import json
 import time
 import shutil
 import threading
+import subprocess
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -77,6 +78,9 @@ _DEBUG_LOG_LIMIT = 300
 _transcribe_jobs: dict[str, dict] = {}
 _transcribe_jobs_lock = threading.Lock()
 _TRANSCRIBE_JOB_LIMIT = 100
+_TRANSCRIBE_CHUNK_SECONDS = 300
+_TRANSCRIBE_CHUNK_RETRIES = 3
+_TRANSCRIBE_PROGRESS_STEP_SECONDS = 5.0
 
 
 def add_debug_log(level: str, message: str) -> None:
@@ -137,43 +141,52 @@ def run_transcribe_job(job_id: str, tmp_path: str, selected_model: str, language
 
     try:
         add_debug_log("debug", f"job={job_id} loading whisper model")
-        whisper_model = get_whisper_model(selected_model)
-        update_transcribe_job(job_id, message="文字起こしを開始しました。", progress=2)
-
-        segments, info = whisper_model.transcribe(tmp_path, language=language, vad_filter=True)
-        total_duration = float(info.duration or 0.0)
-
-        transcript_parts = []
-        timed_segments = []
-        for seg in segments:
-            text = seg.text.strip()
-            if not text:
-                continue
-
-            transcript_parts.append(text)
-            timed_segments.append(
-                {
-                    "start": round(seg.start, 2),
-                    "end": round(seg.end, 2),
-                    "text": text,
-                }
+        probed_duration = probe_audio_duration_seconds(tmp_path)
+        if probed_duration:
+            planned_chunks = max(1, int((probed_duration + _TRANSCRIBE_CHUNK_SECONDS - 1) // _TRANSCRIBE_CHUNK_SECONDS))
+            if planned_chunks > 1:
+                update_transcribe_job(
+                    job_id,
+                    message=(
+                        "音声ファイルが大きいので分割モードで実行します。"
+                        f" チャンク数={planned_chunks}"
+                    ),
+                    progress=2,
+                )
+            else:
+                update_transcribe_job(
+                    job_id,
+                    message="分割モードは使用しません。理由: 音声長が5分以下。",
+                    progress=2,
+                )
+        else:
+            update_transcribe_job(
+                job_id,
+                message="分割判定に必要な音声長を取得できませんでした。フォールバックで処理します。",
+                progress=2,
             )
 
-            if total_duration > 0:
-                ratio = max(0.0, min(1.0, float(seg.end) / total_duration))
-                progress = min(99, max(2, int(ratio * 100)))
-            else:
-                progress = min(99, max(2, 2 + len(timed_segments)))
+        transcribed = transcribe_with_chunk_restart(
+            input_path=tmp_path,
+            selected_model=selected_model,
+            language=language,
+            progress_cb=lambda progress, chunk_no, chunk_total, end_sec: update_transcribe_job(
+                job_id,
+                progress=max(2, progress),
+                message=(
+                    f"文字起こし中... {max(2, progress)}% "
+                    f"(チャンク {chunk_no}/{chunk_total}, {round(end_sec, 1)}秒まで完了)"
+                ),
+            ),
+            logger=lambda level, msg: add_debug_log(level, f"job={job_id} {msg}"),
+        )
 
-            update_transcribe_job(job_id, progress=progress, message=f"文字起こし中... {progress}%")
-
-        transcript = "\n".join(transcript_parts)
         result = {
             "model": selected_model,
-            "language": info.language,
-            "duration": round(info.duration, 2) if info.duration else None,
-            "text": transcript,
-            "segments": timed_segments,
+            "language": transcribed.get("language", language),
+            "duration": transcribed.get("duration"),
+            "text": transcribed.get("text", ""),
+            "segments": transcribed.get("segments", []),
         }
 
         update_transcribe_job(
@@ -186,7 +199,10 @@ def run_transcribe_job(job_id: str, tmp_path: str, selected_model: str, language
         )
         add_debug_log(
             "info",
-            f"transcribe done: job={job_id}, language={info.language}, segments={len(timed_segments)}, chars={len(transcript)}",
+            (
+                f"transcribe done: job={job_id}, language={transcribed.get('language', language)}, "
+                f"segments={len(transcribed.get('segments', []))}, chars={len(transcribed.get('text', ''))}"
+            ),
         )
     except Exception as exc:
         update_transcribe_job(
@@ -274,6 +290,247 @@ def get_whisper_model(model_name: str) -> WhisperModel:
             compute_type=WHISPER_COMPUTE_TYPE,
         )
     return _whisper_models[model_name]
+
+
+def probe_audio_duration_seconds(file_path: str) -> Optional[float]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        value = (result.stdout or "").strip()
+        if not value:
+            return None
+        seconds = float(value)
+        if seconds <= 0:
+            return None
+        return seconds
+    except Exception:
+        return None
+
+
+def extract_audio_chunk(source_path: str, start_sec: float, duration_sec: float, suffix: str) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as chunk_tmp:
+        chunk_path = chunk_tmp.name
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        str(start_sec),
+        "-i",
+        source_path,
+        "-t",
+        str(duration_sec),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        chunk_path,
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return chunk_path
+    except Exception:
+        try:
+            os.remove(chunk_path)
+        except OSError:
+            pass
+        raise
+
+
+def transcribe_with_chunk_restart(
+    input_path: str,
+    selected_model: str,
+    language: str,
+    progress_cb=None,
+    logger=None,
+) -> dict:
+    if logger:
+        logger(
+            "info",
+            (
+                f"chunked transcribe init: model={selected_model}, language={language}, "
+                f"chunk_seconds={_TRANSCRIBE_CHUNK_SECONDS}, retries={_TRANSCRIBE_CHUNK_RETRIES}"
+            ),
+        )
+
+    whisper_model = get_whisper_model(selected_model)
+    suffix = Path(input_path).suffix or ".tmp"
+
+    total_duration = probe_audio_duration_seconds(input_path)
+    duration_probe_ok = bool(total_duration)
+    if not total_duration:
+        if logger:
+            logger(
+                "warning",
+                (
+                    "audio duration probe failed; "
+                    f"fallback duration={_TRANSCRIBE_CHUNK_SECONDS}s"
+                ),
+            )
+        total_duration = float(_TRANSCRIBE_CHUNK_SECONDS)
+    elif logger:
+        logger("debug", f"audio duration detected: {round(total_duration, 2)}s")
+
+    chunk_size = float(_TRANSCRIBE_CHUNK_SECONDS)
+    total_chunks = max(1, int((total_duration + chunk_size - 1) // chunk_size))
+    if logger:
+        logger(
+            "info",
+            (
+                f"chunk plan: total_duration={round(total_duration, 2)}s, "
+                f"chunk_size={int(chunk_size)}s, chunks={total_chunks}"
+            ),
+        )
+        if total_chunks > 1:
+            logger(
+                "info",
+                (
+                    "音声ファイルが大きいので分割モードで実行します。"
+                    f" チャンク数={total_chunks} (1チャンク{int(chunk_size)}秒)"
+                ),
+            )
+        else:
+            reason = (
+                "音声長が5分以下"
+                if duration_probe_ok
+                else "音声長を取得できず分割判定不可(フォールバック)"
+            )
+            logger(
+                "info",
+                f"分割モードは使用しません。理由: {reason}。",
+            )
+
+    transcript_parts = []
+    timed_segments = []
+    detected_language: Optional[str] = None
+
+    for chunk_index in range(total_chunks):
+        start_sec = float(chunk_index * _TRANSCRIBE_CHUNK_SECONDS)
+        remaining = max(0.0, total_duration - start_sec)
+        duration_sec = chunk_size if remaining <= 0 else min(chunk_size, remaining)
+        if duration_sec <= 0:
+            break
+
+        if logger:
+            logger(
+                "debug",
+                f"transcribe chunk start: chunk={chunk_index + 1}/{total_chunks}, start={round(start_sec, 2)}s, duration={round(duration_sec, 2)}s",
+            )
+
+        last_error = None
+        for attempt in range(1, _TRANSCRIBE_CHUNK_RETRIES + 1):
+            chunk_path = ""
+            try:
+                if logger and attempt > 1:
+                    logger(
+                        "warning",
+                        (
+                            f"chunk retry: chunk={chunk_index + 1}/{total_chunks}, "
+                            f"attempt={attempt}/{_TRANSCRIBE_CHUNK_RETRIES}, restart_from={round(start_sec, 2)}s"
+                        ),
+                    )
+
+                chunk_path = extract_audio_chunk(input_path, start_sec, duration_sec, suffix)
+                segments, info = whisper_model.transcribe(chunk_path, language=language, vad_filter=True)
+                if not detected_language:
+                    detected_language = info.language
+
+                chunk_segment_count = 0
+                last_reported_progress = max(0, int(start_sec / total_duration * 100))
+                last_reported_time = start_sec
+                for seg in segments:
+                    seg_end_overall = min(total_duration, start_sec + float(seg.end))
+
+                    # Interpolate coarse segment boundaries into smoother pseudo progress updates.
+                    next_tick = last_reported_time + _TRANSCRIBE_PROGRESS_STEP_SECONDS
+                    while next_tick < seg_end_overall:
+                        pseudo_progress = min(99, int((next_tick / total_duration) * 100))
+                        if pseudo_progress > last_reported_progress and progress_cb:
+                            progress_cb(pseudo_progress, chunk_index + 1, total_chunks, next_tick)
+                            last_reported_progress = pseudo_progress
+                        next_tick += _TRANSCRIBE_PROGRESS_STEP_SECONDS
+
+                    pseudo_progress = min(99, int((seg_end_overall / total_duration) * 100))
+                    if pseudo_progress > last_reported_progress and progress_cb:
+                        progress_cb(pseudo_progress, chunk_index + 1, total_chunks, seg_end_overall)
+                        last_reported_progress = pseudo_progress
+                    last_reported_time = max(last_reported_time, seg_end_overall)
+
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+
+                    abs_start = round(start_sec + float(seg.start), 2)
+                    abs_end = round(start_sec + float(seg.end), 2)
+                    transcript_parts.append(text)
+                    timed_segments.append({"start": abs_start, "end": abs_end, "text": text})
+                    chunk_segment_count += 1
+
+                progress = min(99, int(min(total_duration, start_sec + duration_sec) / total_duration * 100))
+                if progress_cb and progress > last_reported_progress:
+                    progress_cb(progress, chunk_index + 1, total_chunks, start_sec + duration_sec)
+
+                if logger:
+                    logger(
+                        "debug",
+                        (
+                            f"transcribe chunk done: chunk={chunk_index + 1}/{total_chunks}, "
+                            f"segments={chunk_segment_count}, elapsed_to={round(start_sec + duration_sec, 2)}s"
+                        ),
+                    )
+
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                if logger:
+                    logger(
+                        "error",
+                        (
+                            f"transcribe chunk failed: chunk={chunk_index + 1}/{total_chunks}, "
+                            f"attempt={attempt}/{_TRANSCRIBE_CHUNK_RETRIES}, "
+                            f"restart_from={round(start_sec, 2)}s, error={str(exc)}"
+                        ),
+                    )
+                if attempt >= _TRANSCRIBE_CHUNK_RETRIES:
+                    raise
+            finally:
+                if chunk_path:
+                    try:
+                        os.remove(chunk_path)
+                    except OSError:
+                        pass
+
+        if last_error is not None:
+            raise last_error
+
+    transcript = "\n".join(transcript_parts)
+    if logger:
+        logger(
+            "info",
+            (
+                f"chunked transcribe complete: chunks={total_chunks}, "
+                f"segments={len(timed_segments)}, chars={len(transcript)}"
+            ),
+        )
+    return {
+        "language": detected_language or language,
+        "duration": round(total_duration, 2) if total_duration else None,
+        "text": transcript,
+        "segments": timed_segments,
+    }
 
 
 def simple_local_summary(text: str, style: str) -> str:
@@ -528,38 +785,27 @@ async def transcribe_audio(
         add_debug_log("debug", f"temporary file created: {tmp_path}, bytes={len(content)}")
 
     try:
-        add_debug_log("debug", "loading whisper model")
-        whisper_model = get_whisper_model(selected_model)
-        add_debug_log("debug", "running whisper transcribe")
-        segments, info = whisper_model.transcribe(tmp_path, language=language, vad_filter=True)
-
-        transcript_parts = []
-        timed_segments = []
-        for seg in segments:
-            text = seg.text.strip()
-            if not text:
-                continue
-            transcript_parts.append(text)
-            timed_segments.append(
-                {
-                    "start": round(seg.start, 2),
-                    "end": round(seg.end, 2),
-                    "text": text,
-                }
-            )
-
-        transcript = "\n".join(transcript_parts)
+        add_debug_log("debug", "running chunked whisper transcribe")
+        transcribed = transcribe_with_chunk_restart(
+            input_path=tmp_path,
+            selected_model=selected_model,
+            language=language,
+            logger=add_debug_log,
+        )
         add_debug_log(
             "info",
-            f"transcribe done: language={info.language}, segments={len(timed_segments)}, chars={len(transcript)}",
+            (
+                f"transcribe done: language={transcribed.get('language', language)}, "
+                f"segments={len(transcribed.get('segments', []))}, chars={len(transcribed.get('text', ''))}"
+            ),
         )
         return JSONResponse(
             {
                 "model": selected_model,
-                "language": info.language,
-                "duration": round(info.duration, 2) if info.duration else None,
-                "text": transcript,
-                "segments": timed_segments,
+                "language": transcribed.get("language", language),
+                "duration": transcribed.get("duration"),
+                "text": transcribed.get("text", ""),
+                "segments": transcribed.get("segments", []),
             }
         )
     except Exception as exc:

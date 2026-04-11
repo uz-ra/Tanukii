@@ -40,6 +40,7 @@ const debugLogoPath = "/Tanukii-Light.png";
 
 const localLogs = [];
 let debugMode = false;
+let lastTranscribeLoggedPercent = null;
 
 if (statusEl) {
   statusEl.style.display = "none";
@@ -53,6 +54,17 @@ function setStatus(message) {
   const text = String(message || "").trim();
   if (!text) {
     return;
+  }
+
+  const progressMatch = text.match(/文字起こし中\.\.\.\s*(\d+)%/);
+  if (progressMatch) {
+    const percent = Number(progressMatch[1]);
+    if (Number.isFinite(percent) && percent === lastTranscribeLoggedPercent) {
+      return;
+    }
+    lastTranscribeLoggedPercent = percent;
+  } else if (/文字起こしが完了しました|文字起こしに失敗しました/.test(text)) {
+    lastTranscribeLoggedPercent = null;
   }
 
   statusEl.style.display = "none";
@@ -82,6 +94,7 @@ function setTranscribeProgress(percent, visible = true) {
 
 async function waitForTranscribeJob(jobId, timeoutMs = 600000) {
   const startedAt = Date.now();
+  let lastJobMessage = "";
 
   while (true) {
     if (Date.now() - startedAt > timeoutMs) {
@@ -108,9 +121,17 @@ async function waitForTranscribeJob(jobId, timeoutMs = 600000) {
     }
 
     if (job.status === "queued") {
-      setStatus("文字起こしキュー待機中...");
+      const message = job.message || "文字起こしキュー待機中...";
+      if (message !== lastJobMessage) {
+        setStatus(message);
+        lastJobMessage = message;
+      }
     } else {
-      setStatus(`文字起こし中... ${Math.round(progress)}%`);
+      const message = job.message || `文字起こし中... ${Math.round(progress)}%`;
+      if (message !== lastJobMessage) {
+        setStatus(message);
+        lastJobMessage = message;
+      }
     }
 
     await sleep(700);
