@@ -38,6 +38,10 @@
           <label class="label" for="language">言語コード</label>
           <input id="language" type="text" value="ja" />
 
+          <label class="label" for="topic">話題（キーワード）</label>
+          <input id="topic" type="text" placeholder="例: 技術カンファレンス、人工知能、プログラミング" />
+          <p style="font-size: 0.9rem; color: #666; margin: 0 0 1rem 0;">文字起こしの精度を向上させるため、カンマ区切りで話題に関連するキーワードを入力してください</p>
+
           <button id="transcribeBtn">文字起こし開始</button>
 
           <div id="transcribeProgressWrap" class="progressWrap" hidden>
@@ -61,6 +65,12 @@
 
         <section class="view card" id="summarizeView">
           <h2>要約</h2>
+          
+          <label class="label" for="resumeFile">レジュメファイル（PDF/Word）</label>
+          <input id="resumeFile" type="file" accept=".pdf,.docx" />
+          <button id="uploadResumeBtn" type="button">レジュメを読み込む</button>
+          <div id="resumeStatus" style="display: none; margin-top: 0.5rem; padding: 0.5rem; background-color: #f0f0f0; border-radius: 4px;"></div>
+
           <label class="label" for="style">要約スタイル</label>
           <select id="style">
             <option value="bullets">箇条書き</option>

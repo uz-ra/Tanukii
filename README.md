@@ -31,6 +31,9 @@
 ## 主な機能
 
 - 音声ファイルの文字起こし
+- **話題キーワード入力による文字起こし精度向上**
+- レジュメファイル（PDF/Word）の読み込み
+- 文字起こし結果とレジュメを組み合わせて要約
 - 要約スタイル切替（箇条書き / 議事録 / アクション抽出）
 - 設定の読込・保存
 - デバッグモード時のログ表示
@@ -39,9 +42,10 @@
 
 - `GET /api/health`
 - `POST /api/transcribe` (multipart: file, language, model)
-- `POST /api/transcribe/start` (multipart: file, language, model)
+- `POST /api/transcribe/start` (multipart: file, language, model, **initial_prompt**) - initial_promptパラメータ追加
 - `GET /api/transcribe/jobs/{job_id}`
 - `POST /api/summarize` (multipart: text, style, provider, model, api_key, system_prompt, user_prompt_template)
+- `POST /api/extract-resume` (multipart: file)
 - `GET /api/config`
 - `POST /api/config`
 - `GET /api/debug/logs`

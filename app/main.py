@@ -18,6 +18,16 @@ from faster_whisper import WhisperModel
 from pydantic import BaseModel
 
 try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
+try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
@@ -103,7 +113,7 @@ def update_transcribe_job(job_id: str, **fields) -> None:
         job["updated_at"] = time.time()
 
 
-def create_transcribe_job(selected_model: str, language: str, filename: str) -> str:
+def create_transcribe_job(selected_model: str, language: str, filename: str, initial_prompt: str = "") -> str:
     job_id = str(uuid4())
     now = time.time()
     with _transcribe_jobs_lock:
@@ -120,6 +130,7 @@ def create_transcribe_job(selected_model: str, language: str, filename: str) -> 
             "model": selected_model,
             "language": language,
             "filename": filename,
+            "initial_prompt": initial_prompt,
             "result": None,
             "error": None,
             "created_at": now,
@@ -136,7 +147,7 @@ def get_transcribe_job(job_id: str) -> Optional[dict]:
         return dict(job)
 
 
-def run_transcribe_job(job_id: str, tmp_path: str, selected_model: str, language: str) -> None:
+def run_transcribe_job(job_id: str, tmp_path: str, selected_model: str, language: str, initial_prompt: str = "") -> None:
     update_transcribe_job(job_id, status="running", message="モデルを読み込み中です。", progress=1)
 
     try:
@@ -170,6 +181,7 @@ def run_transcribe_job(job_id: str, tmp_path: str, selected_model: str, language
             input_path=tmp_path,
             selected_model=selected_model,
             language=language,
+            initial_prompt=initial_prompt,
             progress_cb=lambda progress, chunk_no, chunk_total, end_sec: update_transcribe_job(
                 job_id,
                 progress=max(2, progress),
@@ -353,6 +365,7 @@ def transcribe_with_chunk_restart(
     input_path: str,
     selected_model: str,
     language: str,
+    initial_prompt: str = "",
     progress_cb=None,
     logger=None,
 ) -> dict:
@@ -443,7 +456,10 @@ def transcribe_with_chunk_restart(
                     )
 
                 chunk_path = extract_audio_chunk(input_path, start_sec, duration_sec, suffix)
-                segments, info = whisper_model.transcribe(chunk_path, language=language, vad_filter=True)
+                transcribe_kwargs = {"language": language, "vad_filter": True}
+                if initial_prompt:
+                    transcribe_kwargs["initial_prompt"] = initial_prompt
+                segments, info = whisper_model.transcribe(chunk_path, **transcribe_kwargs)
                 if not detected_language:
                     detected_language = info.language
 
@@ -567,6 +583,55 @@ def normalize_prompt_template(template: str) -> str:
     if not template:
         return DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE
     return template.replace("\\n", "\n")
+
+
+def extract_text_from_pdf(file_path: str) -> str:
+    """PDF ファイルからテキストを抽出"""
+    if PdfReader is None:
+        raise RuntimeError("pypdf ライブラリが利用できません。")
+    
+    try:
+        reader = PdfReader(file_path)
+        text_parts = []
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+        return "\n".join(text_parts)
+    except Exception as exc:
+        raise RuntimeError(f"PDF テキスト抽出に失敗しました: {str(exc)}")
+
+
+def extract_text_from_docx(file_path: str) -> str:
+    """Word ファイル (.docx) からテキストを抽出"""
+    if Document is None:
+        raise RuntimeError("python-docx ライブラリが利用できません。")
+    
+    try:
+        doc = Document(file_path)
+        text_parts = []
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():
+                text_parts.append(paragraph.text)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        text_parts.append(cell.text)
+        return "\n".join(text_parts)
+    except Exception as exc:
+        raise RuntimeError(f"Word ファイルのテキスト抽出に失敗しました: {str(exc)}")
+
+
+def extract_text_from_resume(file_path: str, file_name: str) -> str:
+    """レジュメファイルからテキストを抽出（PDF or DOCX に対応）"""
+    file_lower = file_name.lower()
+    if file_lower.endswith(".pdf"):
+        return extract_text_from_pdf(file_path)
+    elif file_lower.endswith(".docx"):
+        return extract_text_from_docx(file_path)
+    else:
+        raise RuntimeError(f"対応していないファイル形式です: {file_name}")
 
 
 def build_summary_prompt(text: str, style: str, prompt_template: str) -> str:
@@ -824,6 +889,7 @@ async def start_transcribe_job(
     file: UploadFile = File(...),
     language: str = Form("ja"),
     model: str = Form(""),
+    initial_prompt: str = Form(""),
 ) -> JSONResponse:
     if not file.filename:
         raise HTTPException(status_code=400, detail="ファイル名が不正です。")
@@ -846,16 +912,22 @@ async def start_transcribe_job(
         tmp.write(content)
         tmp_path = tmp.name
 
-    job_id = create_transcribe_job(selected_model=selected_model, language=language, filename=file.filename)
+    initial_prompt_normalized = (initial_prompt or "").strip()
+    job_id = create_transcribe_job(
+        selected_model=selected_model,
+        language=language,
+        filename=file.filename,
+        initial_prompt=initial_prompt_normalized,
+    )
     add_debug_log(
         "info",
-        f"transcribe start: job={job_id}, file={file.filename}, language={language}, model={selected_model}",
+        f"transcribe start: job={job_id}, file={file.filename}, language={language}, model={selected_model}, has_prompt={bool(initial_prompt_normalized)}",
     )
     add_debug_log("debug", f"temporary file created: {tmp_path}, bytes={len(content)}")
 
     thread = threading.Thread(
         target=run_transcribe_job,
-        args=(job_id, tmp_path, selected_model, language),
+        args=(job_id, tmp_path, selected_model, language, initial_prompt_normalized),
         daemon=True,
     )
     thread.start()
@@ -891,6 +963,54 @@ def get_transcribe_job_status(job_id: str) -> JSONResponse:
         response["error"] = job.get("error") or "unknown error"
 
     return JSONResponse(response)
+
+
+@app.post("/api/extract-resume")
+async def extract_resume(file: UploadFile = File(...)) -> JSONResponse:
+    """レジュメファイル（PDF/DOCX）からテキストを抽出"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="ファイルを選択してください。")
+    
+    # ファイル形式チェック
+    file_lower = file.filename.lower()
+    if not (file_lower.endswith(".pdf") or file_lower.endswith(".docx")):
+        raise HTTPException(
+            status_code=400, 
+            detail="PDF または Word ファイル (.docx) のみ対応しています。"
+        )
+    
+    # 一時ファイルに保存
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as tmp_file:
+            tmp_path = tmp_file.name
+            content = await file.read()
+            tmp_file.write(content)
+        
+        # テキスト抽出
+        extracted_text = extract_text_from_resume(tmp_path, file.filename)
+        if not extracted_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="ファイルからテキストを抽出できませんでした。"
+            )
+        
+        add_debug_log("info", f"resume extracted: filename={file.filename}, chars={len(extracted_text)}")
+        return JSONResponse({
+            "text": extracted_text,
+            "filename": file.filename
+        })
+    except HTTPException:
+        raise
+    except Exception as exc:
+        add_debug_log("error", f"resume extraction failed: filename={file.filename}, error={str(exc)}")
+        raise HTTPException(status_code=500, detail=f"ファイル処理エラー: {str(exc)}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 @app.post("/api/summarize")

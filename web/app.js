@@ -12,6 +12,9 @@ const copyLogsBtn = document.getElementById("copyLogsBtn");
 const clearLogsBtn = document.getElementById("clearLogsBtn");
 const sidebarToggleBtn = document.getElementById("sidebarToggleBtn");
 const sidebarBackdrop = document.getElementById("sidebarBackdrop");
+const resumeFileEl = document.getElementById("resumeFile");
+const uploadResumeBtn = document.getElementById("uploadResumeBtn");
+const resumeStatusEl = document.getElementById("resumeStatus");
 
 const menuButtons = Array.from(document.querySelectorAll(".menuBtn"));
 const views = Array.from(document.querySelectorAll(".view"));
@@ -28,6 +31,7 @@ const openaiFieldsEl = document.getElementById("openaiFields");
 const transcriptEl = document.getElementById("transcript");
 const summaryInputEl = document.getElementById("summaryInput");
 const summaryEl = document.getElementById("summary");
+const topicEl = document.getElementById("topic");
 const debugLogEl = document.getElementById("debugLog");
 const statusEl = document.getElementById("status");
 const topLogoEl = document.getElementById("topLogo");
@@ -420,6 +424,7 @@ function forwardToSummarize() {
 async function transcribe() {
   const fileInput = document.getElementById("audio");
   const languageInput = document.getElementById("language");
+  const topicInput = document.getElementById("topic");
   const whisperModelInput = document.getElementById("whisperModel");
   const file = fileInput.files[0];
 
@@ -432,10 +437,11 @@ async function transcribe() {
   formData.append("file", file);
   formData.append("language", languageInput.value || "ja");
   formData.append("model", whisperModelInput.value || "small");
+  formData.append("initial_prompt", topicInput.value || "");
 
   setTranscribeProgress(0, true);
   setStatus("文字起こしジョブを開始します...");
-  logDebug("info", `transcribe requested: file=${file.name}, model=${whisperModelInput.value}`);
+  logDebug("info", `transcribe requested: file=${file.name}, model=${whisperModelInput.value}, has_topic=${!!topicInput.value}`);
   transcribeBtn.disabled = true;
 
   try {
@@ -527,6 +533,61 @@ async function summarize() {
   }
 }
 
+async function uploadResume() {
+  const file = resumeFileEl.files[0];
+  if (!file) {
+    setStatus("レジュメファイルを選択してください。");
+    return;
+  }
+
+  const allowedTypes = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
+  if (!allowedTypes.includes(file.type)) {
+    setStatus("PDF または Word ファイル (.docx) のみ対応しています。");
+    return;
+  }
+
+  resumeStatusEl.style.display = "block";
+  resumeStatusEl.innerHTML = "レジュメを読み込み中...";
+  uploadResumeBtn.disabled = true;
+
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const response = await fetchWithTimeout(
+      "/api/extract-resume",
+      { method: "POST", body: formData },
+      60000
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`HTTP ${response.status} ${errorText}`);
+    }
+
+    const data = await response.json();
+    const resumeText = data.text || "";
+    const currentText = summaryInputEl.value.trim();
+
+    if (currentText) {
+      summaryInputEl.value = currentText + "\n\n【レジュメ内容】\n" + resumeText;
+    } else {
+      summaryInputEl.value = resumeText;
+    }
+
+    resumeStatusEl.innerHTML = `✓ 読み込み完了: ${file.name}`;
+    setStatus(`レジュメを読み込みました。(${file.name})`);
+    logDebug("info", `resume loaded: filename=${file.name}, chars=${resumeText.length}`);
+  } catch (error) {
+    console.error(error);
+    resumeStatusEl.innerHTML = `✗ エラー: ${error.message}`;
+    logDebug("error", `resume upload failed: ${error.message}`);
+    setStatus("レジュメの読み込みに失敗しました。");
+  } finally {
+    uploadResumeBtn.disabled = false;
+  }
+}
+
 for (const button of menuButtons) {
   button.addEventListener("click", () => {
     const viewId = button.dataset.view;
@@ -547,6 +608,7 @@ debugModeSettingEl.addEventListener("change", () => setDebugMode(debugModeSettin
 transcribeBtn.addEventListener("click", transcribe);
 goToSummarizeBtn.addEventListener("click", forwardToSummarize);
 summarizeBtn.addEventListener("click", summarize);
+uploadResumeBtn.addEventListener("click", uploadResume);
 loadConfigBtn.addEventListener("click", loadConfig);
 saveConfigBtn.addEventListener("click", saveConfig);
 refreshLogsBtn.addEventListener("click", refreshDebugLogs);
