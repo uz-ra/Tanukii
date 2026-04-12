@@ -11,7 +11,7 @@
 
 - バックエンド: FastAPI
 - 文字起こし: faster-whisper
-- 要約: local / Gemini / OpenAI（設定で切替、API設定）
+- 要約: gemma-2-2b-jpn-it-gguf(local) / Gemini / OpenAI（設定で切替、API設定）
 - フロントエンド: HTML/CSS/JavaScript
 
 ## セットアップ

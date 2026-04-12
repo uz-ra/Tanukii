@@ -6,3 +6,5 @@ openai==1.99.9
 requests==2.32.5
 pypdf==4.3.1
 python-docx==0.8.11
+llama-cpp-python==0.3.16
+huggingface-hub==0.36.0

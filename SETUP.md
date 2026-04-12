@@ -45,6 +45,12 @@ cp .env.example .env
 
 - `WHISPER_MODEL`: `tiny` / `base` / `small` / `medium` / `large`
 - `SUMMARY_PROVIDER`: `auto` / `gemini` / `openai` / `local`
+- `LOCAL_SUMMARY_MODEL`: 既定 `alfredplpl/gemma-2-2b-jpn-it-gguf`
+- `LOCAL_SUMMARY_GGUF_FILE`: 既定 `gemma-2-2b-jpn-it-Q4_K_M.gguf`
+- `LOCAL_SUMMARY_MAX_NEW_TOKENS`: ローカル要約の最大出力トークン数（既定 384）
+- `LOCAL_SUMMARY_TEMPERATURE`: ローカル要約の温度（既定 0.2）
+- `LOCAL_SUMMARY_CONTEXT_LENGTH`: 推論コンテキスト長（既定 4096）
+- `LOCAL_SUMMARY_THREADS`: 推論スレッド数（既定: CPUコアの半分）
 - `OPENAI_API_KEY`, `OPENAI_SUMMARY_MODEL`
 - `GEMINI_API_KEY`, `GEMINI_SUMMARY_MODEL`
 - `CORS_ORIGINS`
@@ -88,7 +94,6 @@ curl -s http://127.0.0.1:8000/api/health
 ### 効果
 
 - 技術用語や専門用語の誤認識を削減
-- 業界特有の用語や社内用語の認識精度向上
 - 複数の類似音の区別が改善される傾向
 
 ### 参考
@@ -96,7 +101,7 @@ curl -s http://127.0.0.1:8000/api/health
 この機能は、Whisper の `initial_prompt` パラメータを使い、以下の記事で紹介されている手法を実装しています：
 https://note.com/kirillovlov/n/n4af603aabb26
 
-## 10. 新機能：レジュメ読み込み機能
+## 10. レジュメ読み込み機能
 
 要約ページ上で PDF または Word ファイル (.docx) をアップロードしてレジュメ内容を読み込むことができます。
 
@@ -143,3 +148,5 @@ lsof -ti:8000 | xargs kill -9
 ```bash
 kill -9 $(lsof -t -i :8000)
 ```
+
+Geminiのモデルは```gemini-3-flash-preview```か```gemini-3.1-flash-lite-preview```がおすすめ

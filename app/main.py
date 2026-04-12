@@ -32,6 +32,9 @@ try:
 except Exception:
     OpenAI = None
 
+Llama = None
+hf_hub_download = None
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
@@ -48,6 +51,12 @@ OPENAI_MODEL = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4.1-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", "gemini-2.0-flash")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+LOCAL_SUMMARY_MODEL = os.getenv("LOCAL_SUMMARY_MODEL", "alfredplpl/gemma-2-2b-jpn-it-gguf")
+LOCAL_SUMMARY_GGUF_FILE = os.getenv("LOCAL_SUMMARY_GGUF_FILE", "gemma-2-2b-jpn-it-Q4_K_M.gguf")
+LOCAL_SUMMARY_MAX_NEW_TOKENS = int(os.getenv("LOCAL_SUMMARY_MAX_NEW_TOKENS", "384"))
+LOCAL_SUMMARY_TEMPERATURE = float(os.getenv("LOCAL_SUMMARY_TEMPERATURE", "0.2"))
+LOCAL_SUMMARY_CONTEXT_LENGTH = int(os.getenv("LOCAL_SUMMARY_CONTEXT_LENGTH", "4096"))
+LOCAL_SUMMARY_THREADS = int(os.getenv("LOCAL_SUMMARY_THREADS", str(max(1, (os.cpu_count() or 4) // 2))))
 DEFAULT_SUMMARY_SYSTEM_PROMPT = (
     "あなたは日本語の会議要約アシスタントです。"
     "冗長さを避け、実務向けにまとめてください。"
@@ -66,6 +75,12 @@ DEFAULT_CONFIG = {
     "openai_api_key": OPENAI_API_KEY or "",
     "gemini_model": GEMINI_MODEL,
     "gemini_api_key": GEMINI_API_KEY or "",
+    "local_summary_model": LOCAL_SUMMARY_MODEL,
+    "local_summary_gguf_file": LOCAL_SUMMARY_GGUF_FILE,
+    "local_summary_max_new_tokens": LOCAL_SUMMARY_MAX_NEW_TOKENS,
+    "local_summary_temperature": LOCAL_SUMMARY_TEMPERATURE,
+    "local_summary_context_length": LOCAL_SUMMARY_CONTEXT_LENGTH,
+    "local_summary_threads": LOCAL_SUMMARY_THREADS,
 }
 
 
@@ -91,6 +106,8 @@ _TRANSCRIBE_JOB_LIMIT = 100
 _TRANSCRIBE_CHUNK_SECONDS = 300
 _TRANSCRIBE_CHUNK_RETRIES = 3
 _TRANSCRIBE_PROGRESS_STEP_SECONDS = 5.0
+_local_summary_model_cache: dict[str, dict] = {}
+_local_summary_model_lock = threading.Lock()
 
 
 def add_debug_log(level: str, message: str) -> None:
@@ -242,6 +259,12 @@ class AppConfigPayload(BaseModel):
     openai_api_key: str = ""
     gemini_model: str = GEMINI_MODEL
     gemini_api_key: str = ""
+    local_summary_model: str = LOCAL_SUMMARY_MODEL
+    local_summary_gguf_file: str = LOCAL_SUMMARY_GGUF_FILE
+    local_summary_max_new_tokens: int = LOCAL_SUMMARY_MAX_NEW_TOKENS
+    local_summary_temperature: float = LOCAL_SUMMARY_TEMPERATURE
+    local_summary_context_length: int = LOCAL_SUMMARY_CONTEXT_LENGTH
+    local_summary_threads: int = LOCAL_SUMMARY_THREADS
 
 
 def read_config() -> dict:
@@ -257,11 +280,57 @@ def read_config() -> dict:
         return dict(DEFAULT_CONFIG)
 
     merged = dict(DEFAULT_CONFIG)
-    for key in merged.keys():
+    string_keys = {
+        "whisper_model",
+        "summary_system_prompt",
+        "summary_user_prompt_template",
+        "summary_provider",
+        "openai_model",
+        "openai_api_key",
+        "gemini_model",
+        "gemini_api_key",
+        "local_summary_model",
+        "local_summary_gguf_file",
+    }
+    for key in string_keys:
         if key in loaded and isinstance(loaded[key], str):
             merged[key] = loaded[key].strip()
+
     if "debug_mode" in loaded:
         merged["debug_mode"] = bool(loaded["debug_mode"])
+
+    if "local_summary_max_new_tokens" in loaded:
+        try:
+            merged["local_summary_max_new_tokens"] = max(64, int(loaded["local_summary_max_new_tokens"]))
+        except Exception:
+            pass
+
+    if "local_summary_context_length" in loaded:
+        try:
+            merged["local_summary_context_length"] = max(2048, int(loaded["local_summary_context_length"]))
+        except Exception:
+            pass
+
+    if "local_summary_threads" in loaded:
+        try:
+            merged["local_summary_threads"] = max(1, int(loaded["local_summary_threads"]))
+        except Exception:
+            pass
+
+    if "local_summary_temperature" in loaded:
+        try:
+            temp = float(loaded["local_summary_temperature"])
+            merged["local_summary_temperature"] = min(1.5, max(0.0, temp))
+        except Exception:
+            pass
+
+    # Migrate legacy default that pointed to RakutenAI transformers model.
+    if merged.get("local_summary_model") == "Rakuten/RakutenAI-7B-Instruct":
+        merged["local_summary_model"] = LOCAL_SUMMARY_MODEL
+
+    if not merged.get("local_summary_gguf_file"):
+        merged["local_summary_gguf_file"] = LOCAL_SUMMARY_GGUF_FILE
+
     return merged
 
 
@@ -277,6 +346,12 @@ def write_config(payload: AppConfigPayload) -> dict:
         "openai_api_key": payload.openai_api_key.strip(),
         "gemini_model": payload.gemini_model.strip() or GEMINI_MODEL,
         "gemini_api_key": payload.gemini_api_key.strip(),
+        "local_summary_model": payload.local_summary_model.strip() or LOCAL_SUMMARY_MODEL,
+        "local_summary_gguf_file": payload.local_summary_gguf_file.strip() or LOCAL_SUMMARY_GGUF_FILE,
+        "local_summary_max_new_tokens": max(64, int(payload.local_summary_max_new_tokens)),
+        "local_summary_temperature": min(1.5, max(0.0, float(payload.local_summary_temperature))),
+        "local_summary_context_length": max(2048, int(payload.local_summary_context_length)),
+        "local_summary_threads": max(1, int(payload.local_summary_threads)),
     }
     if data["whisper_model"] not in AVAILABLE_WHISPER_MODELS:
         data["whisper_model"] = WHISPER_MODEL_NAME
@@ -579,6 +654,85 @@ def simple_local_summary(text: str, style: str) -> str:
     ])
 
 
+def get_local_summary_model(model_repo: str, gguf_file: str, n_ctx: int, n_threads: int) -> dict:
+    global Llama, hf_hub_download
+    if Llama is None or hf_hub_download is None:
+        try:
+            from llama_cpp import Llama as _Llama
+            from huggingface_hub import hf_hub_download as _hf_hub_download
+
+            Llama = _Llama
+            hf_hub_download = _hf_hub_download
+        except Exception as exc:
+            raise RuntimeError("ローカルGGUF要約に必要な依存(llama-cpp-python/huggingface_hub)が不足しています。") from exc
+
+    cache_key = f"{model_repo}:{gguf_file}:{n_ctx}:{n_threads}"
+
+    with _local_summary_model_lock:
+        cached = _local_summary_model_cache.get(cache_key)
+        if cached:
+            return cached
+
+        model_cache_dir = MODEL_DIR / "gguf"
+        model_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        model_path = hf_hub_download(
+            repo_id=model_repo,
+            filename=gguf_file,
+            local_dir=str(model_cache_dir),
+            local_dir_use_symlinks=False,
+        )
+
+        llm = Llama(
+            model_path=str(model_path),
+            n_ctx=max(2048, int(n_ctx)),
+            n_threads=max(1, int(n_threads)),
+            n_gpu_layers=0,
+            verbose=False,
+        )
+
+        bundle = {"llm": llm, "model_path": str(model_path)}
+        _local_summary_model_cache[cache_key] = bundle
+        return bundle
+
+
+def summarize_with_local_llm(
+    system_prompt: str,
+    prompt: str,
+    model_repo: str,
+    gguf_file: str,
+    max_new_tokens: int,
+    temperature: float,
+    context_length: int,
+    threads: int,
+) -> str:
+    bundle = get_local_summary_model(model_repo, gguf_file, context_length, threads)
+    llm = bundle["llm"]
+
+    # Some GGUF chat templates reject the system role; merge instructions into user content.
+    merged_user_prompt = f"{system_prompt}\n\n{prompt}".strip()
+    messages = [
+        {"role": "user", "content": merged_user_prompt},
+    ]
+
+    completion = llm.create_chat_completion(
+        messages=messages,
+        max_tokens=max(64, int(max_new_tokens)),
+        temperature=max(0.0, float(temperature)),
+        top_p=0.9,
+    )
+
+    generated_text = (
+        completion.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
+    )
+    if not generated_text:
+        raise RuntimeError("ローカルLLMの出力が空でした。")
+    return generated_text
+
+
 def normalize_prompt_template(template: str) -> str:
     if not template:
         return DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE
@@ -745,7 +899,29 @@ def llm_summary(
     selected_provider = resolve_summary_provider(provider, cfg)
 
     if selected_provider == "local":
-        return simple_local_summary(text, style), "local-fallback"
+        local_model = (cfg.get("local_summary_model") or LOCAL_SUMMARY_MODEL).strip()
+        local_gguf_file = (cfg.get("local_summary_gguf_file") or LOCAL_SUMMARY_GGUF_FILE).strip()
+        local_max_new_tokens = cfg.get("local_summary_max_new_tokens") or LOCAL_SUMMARY_MAX_NEW_TOKENS
+        local_temperature = cfg.get("local_summary_temperature")
+        local_context_length = cfg.get("local_summary_context_length") or LOCAL_SUMMARY_CONTEXT_LENGTH
+        local_threads = cfg.get("local_summary_threads") or LOCAL_SUMMARY_THREADS
+        if local_temperature is None:
+            local_temperature = LOCAL_SUMMARY_TEMPERATURE
+        try:
+            summary = summarize_with_local_llm(
+                system_prompt=system_prompt,
+                prompt=prompt,
+                model_repo=local_model,
+                gguf_file=local_gguf_file,
+                max_new_tokens=int(local_max_new_tokens),
+                temperature=float(local_temperature),
+                context_length=int(local_context_length),
+                threads=int(local_threads),
+            )
+            return summary, f"local:{local_model}/{local_gguf_file}"
+        except Exception as exc:
+            add_debug_log("warning", f"local llm summarize failed: {str(exc)}")
+            return simple_local_summary(text, style), "local-fallback"
 
     if selected_provider == "openai":
         model = (model_override or cfg.get("openai_model") or OPENAI_MODEL).strip()
@@ -779,7 +955,11 @@ def health_check() -> JSONResponse:
     elif selected == "gemini":
         mode = f"gemini:{cfg.get('gemini_model') or GEMINI_MODEL}"
     else:
-        mode = "local-fallback"
+        mode = (
+            "local:"
+            f"{cfg.get('local_summary_model') or LOCAL_SUMMARY_MODEL}/"
+            f"{cfg.get('local_summary_gguf_file') or LOCAL_SUMMARY_GGUF_FILE}"
+        )
 
     return JSONResponse(
         {
