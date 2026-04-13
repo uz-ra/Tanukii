@@ -1,6 +1,7 @@
 const transcribeBtn = document.getElementById("transcribeBtn");
 const goToSummarizeBtn = document.getElementById("goToSummarizeBtn");
 const summarizeBtn = document.getElementById("summarizeBtn");
+const cleanSummaryInputBtn = document.getElementById("cleanSummaryInputBtn");
 const copyTranscriptBtn = document.getElementById("copyTranscriptBtn");
 const downloadTranscriptBtn = document.getElementById("downloadTranscriptBtn");
 const copySummaryBtn = document.getElementById("copySummaryBtn");
@@ -447,6 +448,57 @@ function forwardToSummarize() {
   setStatus("文字起こし結果を要約に引き継ぎました。");
 }
 
+function cleanSummaryInputText() {
+  const originalText = summaryInputEl.value || "";
+  if (!originalText.trim()) {
+    setStatus("要約対象テキストが空です。");
+    return;
+  }
+
+  const fillers = [
+    "え、",
+    "え,",
+    "えー、",
+    "えー,",
+    "えーと、",
+    "えーと,",
+    "えっと、",
+    "えっと,",
+    "ま、",
+    "ま,",
+    "まあ、",
+    "まあ,",
+    "まぁ、",
+    "まぁ,",
+    "あ、",
+    "あ,",
+    "あの、",
+    "あの,",
+    "あー、",
+    "あー,",
+    "うーん、",
+    "うーん,",
+    "うーんと、",
+    "うーんと,",
+    "なんか、",
+    "なんか,",
+    "そのー、",
+    "そのー,",
+    "あのー、",
+    "あのー,",
+  ];
+
+  let cleaned = originalText.replace(/\r\n/g, "\n");
+  cleaned = cleaned.replace(/(^|[^\n。．\.！？!?])\n+/g, "$1");
+  cleaned = cleaned.replace(/[ \u3000]+/g, "");
+  for (const filler of fillers) {
+    cleaned = cleaned.split(filler).join("");
+  }
+
+  summaryInputEl.value = cleaned;
+  setStatus(`要約対象テキストを整形しました。(${originalText.length} → ${cleaned.length}文字)`);
+}
+
 async function transcribe() {
   const fileInput = document.getElementById("audio");
   const languageInput = document.getElementById("language");
@@ -661,6 +713,7 @@ debugModeSettingEl.addEventListener("change", () => setDebugMode(debugModeSettin
 transcribeBtn.addEventListener("click", transcribe);
 goToSummarizeBtn.addEventListener("click", forwardToSummarize);
 summarizeBtn.addEventListener("click", summarize);
+cleanSummaryInputBtn.addEventListener("click", cleanSummaryInputText);
 uploadResumeBtn.addEventListener("click", uploadResume);
 loadConfigBtn.addEventListener("click", loadConfig);
 saveConfigBtn.addEventListener("click", saveConfig);
