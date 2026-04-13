@@ -214,6 +214,11 @@ textarea {
   resize: vertical;
 }
 
+#summaryInput,
+#summary {
+  min-height: 320px;
+}
+
 button {
   margin-top: 12px;
   border: 1px solid var(--line);

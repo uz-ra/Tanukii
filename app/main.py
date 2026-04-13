@@ -5,6 +5,7 @@ import time
 import shutil
 import threading
 import subprocess
+import base64
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -830,20 +831,22 @@ def summarize_with_openai(system_prompt: str, prompt: str, model: str, api_key: 
 
 def summarize_with_gemini(system_prompt: str, prompt: str, model: str, api_key: str) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    parts = [
+        {
+            "text": (
+                f"{system_prompt}\n\n"
+                f"{prompt}"
+            )
+        }
+    ]
+
     response = requests.post(
         url,
         params={"key": api_key},
         json={
             "contents": [
                 {
-                    "parts": [
-                        {
-                            "text": (
-                                f"{system_prompt}\n\n"
-                                f"{prompt}"
-                            )
-                        }
-                    ]
+                    "parts": parts
                 }
             ]
         },
@@ -861,6 +864,73 @@ def summarize_with_gemini(system_prompt: str, prompt: str, model: str, api_key: 
     if not text_parts:
         raise RuntimeError("Gemini 応答からテキストを取得できませんでした。")
     return "\n".join(text_parts).strip()
+
+
+def summarize_with_gemini_raw_file(
+    system_prompt: str,
+    prompt: str,
+    model: str,
+    api_key: str,
+    file_bytes: bytes,
+    file_mime_type: str,
+) -> str:
+    if not file_bytes:
+        raise RuntimeError("RAWファイルが空です。")
+
+    # Keep payload under typical inline_data limits in Gemini APIs.
+    max_bytes = 10 * 1024 * 1024
+    if len(file_bytes) > max_bytes:
+        raise RuntimeError("RAWモードのファイルサイズ上限(10MB)を超えています。")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    response = requests.post(
+        url,
+        params={"key": api_key},
+        json={
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": (
+                                f"{system_prompt}\n\n"
+                                f"以下に添付したレジュメファイルの内容を要約してください。\n"
+                                f"{prompt}"
+                            )
+                        },
+                        {
+                            "inline_data": {
+                                "mime_type": file_mime_type,
+                                "data": encoded,
+                            }
+                        },
+                    ]
+                }
+            ]
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    candidates = payload.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("Gemini の応答が空です。")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text_parts = [part.get("text", "") for part in parts if part.get("text")]
+    if not text_parts:
+        raise RuntimeError("Gemini 応答からテキストを取得できませんでした。")
+    return "\n".join(text_parts).strip()
+
+
+def detect_resume_mime_type(filename: str) -> str:
+    lowered = (filename or "").lower()
+    if lowered.endswith(".pdf"):
+        return "application/pdf"
+    if lowered.endswith(".docx"):
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    return "application/octet-stream"
 
 
 def resolve_summary_provider(provider: str, cfg: dict) -> str:
@@ -1195,18 +1265,95 @@ async def extract_resume(file: UploadFile = File(...)) -> JSONResponse:
 
 @app.post("/api/summarize")
 async def summarize_text(
-    text: str = Form(...),
+    text: str = Form(""),
     style: str = Form("bullets"),
     provider: str = Form("auto"),
+    resume_mode: str = Form("extract"),
+    resume_file: UploadFile | None = File(None),
     model: str = Form(""),
     api_key: str = Form(""),
     system_prompt: str = Form(""),
     user_prompt_template: str = Form(""),
 ) -> JSONResponse:
-    if not text.strip():
+    normalized_resume_mode = (resume_mode or "extract").strip().lower()
+    has_resume_file = resume_file is not None and bool(resume_file.filename)
+
+    # Backward-compatible fallback:
+    # If a file is attached and text is empty, treat it as RAW mode even when
+    # resume_mode was not sent/selected correctly on the client.
+    if has_resume_file and not (text or "").strip():
+        normalized_resume_mode = "raw"
+
+    if normalized_resume_mode not in {"extract", "raw"}:
+        add_debug_log("warning", f"summarize invalid resume_mode: {resume_mode}")
+        raise HTTPException(status_code=400, detail="resume_mode は extract または raw を指定してください。")
+
+    if normalized_resume_mode == "raw":
+        if not has_resume_file:
+            add_debug_log("warning", "summarize raw rejected: resume_file missing")
+            raise HTTPException(status_code=400, detail="RAWモードではレジュメファイルが必須です。")
+        if not text.strip():
+            text = "添付ファイルの内容を要約してください。"
+    elif not text.strip():
         raise HTTPException(status_code=400, detail="要約対象のテキストが空です。")
 
-    add_debug_log("info", f"summarize start: provider={provider}, style={style}, chars={len(text)}")
+    add_debug_log(
+        "info",
+        f"summarize start: provider={provider}, style={style}, chars={len(text)}, resume_mode={normalized_resume_mode}",
+    )
+
+    if normalized_resume_mode == "raw":
+        cfg = read_config()
+        selected_provider = resolve_summary_provider(provider, cfg)
+        if selected_provider != "gemini":
+            add_debug_log("warning", f"summarize raw rejected: provider={selected_provider}")
+            raise HTTPException(
+                status_code=400,
+                detail="RAWモードは現在 Gemini プロバイダのみ対応しています。",
+            )
+
+        model_name = (model or cfg.get("gemini_model") or GEMINI_MODEL).strip()
+        api_key_value = (api_key or cfg.get("gemini_api_key") or "").strip()
+        if not api_key_value:
+            add_debug_log("warning", "summarize raw rejected: gemini api key missing")
+            raise HTTPException(status_code=400, detail="Gemini APIキーが未設定です。")
+
+        system_prompt_value = (system_prompt or cfg.get("summary_system_prompt") or DEFAULT_SUMMARY_SYSTEM_PROMPT).strip()
+        user_prompt_template_value = (
+            user_prompt_template
+            or cfg.get("summary_user_prompt_template")
+            or DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE
+        ).strip()
+        prompt = build_summary_prompt(text, style, user_prompt_template_value)
+
+        file_bytes = await resume_file.read()
+        file_mime = detect_resume_mime_type(resume_file.filename)
+        try:
+            summary = summarize_with_gemini_raw_file(
+                system_prompt=system_prompt_value,
+                prompt=prompt,
+                model=model_name,
+                api_key=api_key_value,
+                file_bytes=file_bytes,
+                file_mime_type=file_mime,
+            )
+            add_debug_log(
+                "info",
+                (
+                    "summarize done: "
+                    f"mode=gemini:{model_name}+raw, chars={len(summary)}, "
+                    f"resume_file={resume_file.filename}, bytes={len(file_bytes)}"
+                ),
+            )
+            return JSONResponse({
+                "summary": summary,
+                "style": style,
+                "summary_mode": f"gemini:{model_name}+raw",
+            })
+        except Exception as exc:
+            add_debug_log("error", f"summarize raw failed: error={str(exc)}")
+            raise HTTPException(status_code=500, detail=f"RAW要約に失敗しました: {str(exc)}")
+
     summary, summary_mode = llm_summary(
         text,
         style,

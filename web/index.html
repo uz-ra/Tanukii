@@ -68,6 +68,11 @@
           
           <label class="label" for="resumeFile">レジュメファイル（PDF/Word）</label>
           <input id="resumeFile" type="file" accept=".pdf,.docx" />
+          <label class="label" for="resumeMode">レジュメ読み込みモード</label>
+          <select id="resumeMode">
+            <option value="extract" selected>抽出モード（テキスト抽出して入力欄へ反映）</option>
+            <option value="raw">RAWモード（ファイルを要約APIへそのまま送信）</option>
+          </select>
           <button id="uploadResumeBtn" type="button">レジュメを読み込む</button>
           <div id="resumeStatus" style="display: none; margin-top: 0.5rem; padding: 0.5rem; background-color: #f0f0f0; border-radius: 4px;"></div>
 
@@ -79,12 +84,12 @@
           </select>
 
           <label class="label" for="summaryInput">要約対象テキスト</label>
-          <textarea id="summaryInput" rows="10" placeholder="文字起こし結果をここに反映します"></textarea>
+          <textarea id="summaryInput" rows="16" placeholder="文字起こし結果をここに反映します"></textarea>
 
           <button id="summarizeBtn">要約作成</button>
 
           <label class="label" for="summary">要約結果</label>
-          <textarea id="summary" rows="10" placeholder="ここに要約が表示されます"></textarea>
+          <textarea id="summary" rows="16" placeholder="ここに要約が表示されます"></textarea>
 
           <div class="buttonRow">
             <button id="copySummaryBtn" type="button">要約をコピー</button>

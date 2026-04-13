@@ -13,6 +13,7 @@ const clearLogsBtn = document.getElementById("clearLogsBtn");
 const sidebarToggleBtn = document.getElementById("sidebarToggleBtn");
 const sidebarBackdrop = document.getElementById("sidebarBackdrop");
 const resumeFileEl = document.getElementById("resumeFile");
+const resumeModeEl = document.getElementById("resumeMode");
 const uploadResumeBtn = document.getElementById("uploadResumeBtn");
 const resumeStatusEl = document.getElementById("resumeStatus");
 
@@ -45,6 +46,7 @@ const debugLogoPath = "/Tanukii-Light.png";
 const localLogs = [];
 let debugMode = false;
 let lastTranscribeLoggedPercent = null;
+let attachedResumeRawFile = null;
 
 if (statusEl) {
   statusEl.style.display = "none";
@@ -244,6 +246,30 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 300000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function readErrorDetail(response) {
+  let bodyText = "";
+  try {
+    bodyText = (await response.text()) || "";
+  } catch {
+    return `HTTP ${response.status}`;
+  }
+
+  if (!bodyText.trim()) {
+    return `HTTP ${response.status}`;
+  }
+
+  try {
+    const parsed = JSON.parse(bodyText);
+    if (parsed && typeof parsed.detail === "string" && parsed.detail.trim()) {
+      return `HTTP ${response.status} ${parsed.detail}`;
+    }
+  } catch {
+    // fall through and return raw text
+  }
+
+  return `HTTP ${response.status} ${bodyText}`;
 }
 
 async function loadConfig() {
@@ -479,9 +505,14 @@ async function transcribe() {
 async function summarize() {
   const style = document.getElementById("style").value;
   const provider = providerEl.value;
+  const resumeMode = resumeModeEl.value || "extract";
   const inputText = summaryInputEl.value;
+  const rawFileForRequest = resumeMode === "raw"
+    ? (attachedResumeRawFile || resumeFileEl.files[0] || null)
+    : null;
+  const canSummarizeWithRawOnly = !!rawFileForRequest;
 
-  if (!inputText.trim()) {
+  if (!inputText.trim() && !canSummarizeWithRawOnly) {
     setStatus("要約対象テキストが空です。");
     return;
   }
@@ -497,8 +528,13 @@ async function summarize() {
   formData.append("text", inputText);
   formData.append("style", style);
   formData.append("provider", provider);
+  formData.append("resume_mode", rawFileForRequest ? "raw" : resumeMode);
   formData.append("model", model);
   formData.append("api_key", apiKey);
+
+  if (rawFileForRequest) {
+    formData.append("resume_file", rawFileForRequest, rawFileForRequest.name);
+  }
 
   if (debugMode) {
     formData.append("system_prompt", summarySystemPromptEl.value || "");
@@ -516,8 +552,7 @@ async function summarize() {
       120000
     );
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`HTTP ${response.status} ${errorText}`);
+      throw new Error(await readErrorDetail(response));
     }
 
     const data = await response.json();
@@ -527,7 +562,7 @@ async function summarize() {
   } catch (error) {
     console.error(error);
     logDebug("error", `summarize failed: ${error.message}`);
-    setStatus("要約に失敗しました。");
+    setStatus(`要約に失敗しました。(${error.message})`);
   } finally {
     summarizeBtn.disabled = false;
   }
@@ -535,6 +570,7 @@ async function summarize() {
 
 async function uploadResume() {
   const file = resumeFileEl.files[0];
+  const resumeMode = resumeModeEl.value || "extract";
   if (!file) {
     setStatus("レジュメファイルを選択してください。");
     return;
@@ -551,6 +587,14 @@ async function uploadResume() {
   uploadResumeBtn.disabled = true;
 
   try {
+    if (resumeMode === "raw") {
+      attachedResumeRawFile = file;
+      resumeStatusEl.innerHTML = `✓ RAW添付を保持: ${file.name}`;
+      setStatus(`RAWモードでレジュメを保持しました。(${file.name})`);
+      logDebug("info", `resume raw attached: filename=${file.name}, bytes=${file.size}`);
+      return;
+    }
+
     const formData = new FormData();
     formData.append("file", file);
 
@@ -568,6 +612,7 @@ async function uploadResume() {
     const data = await response.json();
     const resumeText = data.text || "";
     const currentText = summaryInputEl.value.trim();
+    attachedResumeRawFile = null;
 
     if (currentText) {
       summaryInputEl.value = currentText + "\n\n【レジュメ内容】\n" + resumeText;
@@ -586,6 +631,14 @@ async function uploadResume() {
   } finally {
     uploadResumeBtn.disabled = false;
   }
+}
+
+if (resumeModeEl) {
+  resumeModeEl.addEventListener("change", () => {
+    if (resumeModeEl.value !== "raw") {
+      attachedResumeRawFile = null;
+    }
+  });
 }
 
 for (const button of menuButtons) {
