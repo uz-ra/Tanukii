@@ -1,4 +1,5 @@
 const transcribeBtn = document.getElementById("transcribeBtn");
+const pauseTranscribeBtn = document.getElementById("pauseTranscribeBtn");
 const goToSummarizeBtn = document.getElementById("goToSummarizeBtn");
 const summarizeBtn = document.getElementById("summarizeBtn");
 const cleanSummaryInputBtn = document.getElementById("cleanSummaryInputBtn");
@@ -48,6 +49,8 @@ const localLogs = [];
 let debugMode = false;
 let lastTranscribeLoggedPercent = null;
 let attachedResumeRawFile = null;
+let activeTranscribeJobId = "";
+let transcribePaused = false;
 
 if (statusEl) {
   statusEl.style.display = "none";
@@ -99,13 +102,25 @@ function setTranscribeProgress(percent, visible = true) {
   transcribeProgressWrapEl.hidden = !visible;
 }
 
-async function waitForTranscribeJob(jobId, timeoutMs = 600000) {
+async function waitForTranscribeJob(jobId, options = {}) {
+  const maxIdleMs = Number.isFinite(options.maxIdleMs) ? options.maxIdleMs : 900000;
+  const maxTotalMs = Number.isFinite(options.maxTotalMs) ? options.maxTotalMs : 14400000;
+  const onUpdate = typeof options.onUpdate === "function" ? options.onUpdate : null;
+
   const startedAt = Date.now();
+  let lastActivityAt = startedAt;
   let lastJobMessage = "";
+  let lastProgress = -1;
+  let lastStatus = "";
+  let lastUpdatedAt = 0;
 
   while (true) {
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new Error("進捗待機がタイムアウトしました。");
+    const now = Date.now();
+    if (now - startedAt > maxTotalMs) {
+      throw new Error("文字起こし待機が上限時間を超えました。処理を確認してください。");
+    }
+    if (lastStatus !== "paused" && now - lastActivityAt > maxIdleMs) {
+      throw new Error("進捗更新が一定時間なかったため待機を中断しました。");
     }
 
     const response = await fetchWithTimeout(`/api/transcribe/jobs/${encodeURIComponent(jobId)}`, {}, 15000);
@@ -115,19 +130,36 @@ async function waitForTranscribeJob(jobId, timeoutMs = 600000) {
     }
 
     const job = await response.json();
+    const status = String(job.status || "");
     const progress = Number.isFinite(job.progress) ? job.progress : 0;
+    const updatedAtRaw = Number(job.updated_at);
+    const updatedAtMs = Number.isFinite(updatedAtRaw) ? Math.round(updatedAtRaw * 1000) : 0;
+
+    if (status !== lastStatus || progress !== lastProgress || updatedAtMs > lastUpdatedAt) {
+      lastActivityAt = now;
+      lastStatus = status;
+      lastProgress = progress;
+      if (updatedAtMs > lastUpdatedAt) {
+        lastUpdatedAt = updatedAtMs;
+      }
+    }
+
+    if (onUpdate) {
+      onUpdate(job);
+    }
+
     setTranscribeProgress(progress, true);
 
-    if (job.status === "completed") {
+    if (status === "completed") {
       setTranscribeProgress(100, true);
       return job.result || {};
     }
 
-    if (job.status === "failed") {
+    if (status === "failed") {
       throw new Error(job.error || "文字起こしに失敗しました。");
     }
 
-    if (job.status === "queued") {
+    if (status === "queued") {
       const message = job.message || "文字起こしキュー待機中...";
       if (message !== lastJobMessage) {
         setStatus(message);
@@ -142,6 +174,51 @@ async function waitForTranscribeJob(jobId, timeoutMs = 600000) {
     }
 
     await sleep(700);
+  }
+}
+
+function syncPauseButton() {
+  if (!pauseTranscribeBtn) {
+    return;
+  }
+  const hasActiveJob = !!activeTranscribeJobId;
+  pauseTranscribeBtn.disabled = !hasActiveJob;
+  pauseTranscribeBtn.textContent = transcribePaused ? "再開" : "一時停止";
+}
+
+function clearTranscribeJobState() {
+  activeTranscribeJobId = "";
+  transcribePaused = false;
+  syncPauseButton();
+}
+
+async function toggleTranscribePause() {
+  if (!activeTranscribeJobId) {
+    return;
+  }
+
+  const action = transcribePaused ? "resume" : "pause";
+  pauseTranscribeBtn.disabled = true;
+
+  try {
+    const response = await fetchWithTimeout(
+      `/api/transcribe/jobs/${encodeURIComponent(activeTranscribeJobId)}/${action}`,
+      { method: "POST" },
+      10000
+    );
+    if (!response.ok) {
+      throw new Error(await readErrorDetail(response));
+    }
+
+    transcribePaused = !transcribePaused;
+    syncPauseButton();
+    setStatus(transcribePaused ? "文字起こしを一時停止しました。" : "文字起こしを再開しました。");
+  } catch (error) {
+    console.error(error);
+    logDebug("error", `transcribe ${action} failed: ${error.message}`);
+    setStatus(transcribePaused ? "文字起こしの再開に失敗しました。" : "文字起こしの一時停止に失敗しました。");
+  } finally {
+    syncPauseButton();
   }
 }
 
@@ -486,6 +563,7 @@ function cleanSummaryInputText() {
     "そのー,",
     "あのー、",
     "あのー,",
+    "うん。"
   ];
 
   let cleaned = originalText.replace(/\r\n/g, "\n");
@@ -518,6 +596,7 @@ async function transcribe() {
   formData.append("initial_prompt", topicInput.value || "");
 
   setTranscribeProgress(0, true);
+  clearTranscribeJobState();
   setStatus("文字起こしジョブを開始します...");
   logDebug("info", `transcribe requested: file=${file.name}, model=${whisperModelInput.value}, has_topic=${!!topicInput.value}`);
   transcribeBtn.disabled = true;
@@ -539,7 +618,20 @@ async function transcribe() {
     }
 
     logDebug("info", `transcribe job started: job=${started.job_id}`);
-    const data = await waitForTranscribeJob(started.job_id, 600000);
+    activeTranscribeJobId = started.job_id;
+    transcribePaused = false;
+    syncPauseButton();
+    const data = await waitForTranscribeJob(started.job_id, {
+      maxIdleMs: 900000,
+      maxTotalMs: 14400000,
+      onUpdate: (job) => {
+        const paused = job.status === "paused" || !!job.pause_requested;
+        if (paused !== transcribePaused) {
+          transcribePaused = paused;
+          syncPauseButton();
+        }
+      },
+    });
     transcriptEl.value = data.text || "";
     summaryInputEl.value = data.text || "";
     logDebug("info", `transcribe done: chars=${(data.text || "").length}`);
@@ -550,6 +642,7 @@ async function transcribe() {
     setTranscribeProgress(0, false);
     setStatus("文字起こしに失敗しました。");
   } finally {
+    clearTranscribeJobState();
     transcribeBtn.disabled = false;
   }
 }
@@ -628,9 +721,15 @@ async function uploadResume() {
     return;
   }
 
-  const allowedTypes = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
-  if (!allowedTypes.includes(file.type)) {
-    setStatus("PDF または Word ファイル (.docx) のみ対応しています。");
+  const allowedTypes = [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ];
+  const fileNameLower = (file.name || "").toLowerCase();
+  const allowedByExt = [".pdf", ".docx", ".pptx"].some((ext) => fileNameLower.endsWith(ext));
+  if (!allowedTypes.includes(file.type) && !allowedByExt) {
+    setStatus("PDF / Word (.docx) / PowerPoint (.pptx) のみ対応しています。");
     return;
   }
 
@@ -711,6 +810,7 @@ for (const button of menuButtons) {
 providerEl.addEventListener("change", updateProviderFields);
 debugModeSettingEl.addEventListener("change", () => setDebugMode(debugModeSettingEl.checked));
 transcribeBtn.addEventListener("click", transcribe);
+pauseTranscribeBtn.addEventListener("click", toggleTranscribePause);
 goToSummarizeBtn.addEventListener("click", forwardToSummarize);
 summarizeBtn.addEventListener("click", summarize);
 cleanSummaryInputBtn.addEventListener("click", cleanSummaryInputText);
@@ -745,3 +845,4 @@ updateProviderFields();
 showView("transcribeView");
 setSidebarOpen(window.innerWidth > 980);
 loadConfig();
+syncPauseButton();

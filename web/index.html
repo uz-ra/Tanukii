@@ -42,7 +42,10 @@
           <input id="topic" type="text" placeholder="例: 技術カンファレンス、人工知能、プログラミング" />
           <p style="font-size: 0.9rem; color: #666; margin: 0 0 1rem 0;">文字起こしの精度を向上させるため、カンマ区切りで話題に関連するキーワードを入力してください</p>
 
-          <button id="transcribeBtn">文字起こし開始</button>
+          <div class="buttonRow">
+            <button id="transcribeBtn">文字起こし開始</button>
+            <button id="pauseTranscribeBtn" type="button" disabled>一時停止</button>
+          </div>
 
           <div id="transcribeProgressWrap" class="progressWrap" hidden>
             <div class="progressHead">
@@ -66,8 +69,8 @@
         <section class="view card" id="summarizeView">
           <h2>要約</h2>
           
-          <label class="label" for="resumeFile">レジュメファイル（PDF/Word）</label>
-          <input id="resumeFile" type="file" accept=".pdf,.docx" />
+          <label class="label" for="resumeFile">レジュメファイル（PDF/Word/PowerPoint）</label>
+          <input id="resumeFile" type="file" accept=".pdf,.docx,.pptx" />
           <label class="label" for="resumeMode">レジュメ読み込みモード</label>
           <select id="resumeMode">
             <option value="extract" selected>抽出モード（テキスト抽出して入力欄へ反映）</option>

@@ -29,6 +29,11 @@ except Exception:
     Document = None
 
 try:
+    from pptx import Presentation
+except Exception:
+    Presentation = None
+
+try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
@@ -145,6 +150,7 @@ def create_transcribe_job(selected_model: str, language: str, filename: str, ini
             "status": "queued",
             "progress": 0,
             "message": "キューに登録しました。",
+            "pause_requested": False,
             "model": selected_model,
             "language": language,
             "filename": filename,
@@ -200,6 +206,17 @@ def run_transcribe_job(job_id: str, tmp_path: str, selected_model: str, language
             selected_model=selected_model,
             language=language,
             initial_prompt=initial_prompt,
+            should_pause_cb=lambda: bool((get_transcribe_job(job_id) or {}).get("pause_requested")),
+            pause_state_cb=lambda paused: update_transcribe_job(
+                job_id,
+                status="paused" if paused else "running",
+                message="一時停止中です。" if paused else "文字起こしを再開しました。",
+            ),
+            pause_heartbeat_cb=lambda: update_transcribe_job(
+                job_id,
+                status="paused",
+                message="一時停止中です。",
+            ),
             progress_cb=lambda progress, chunk_no, chunk_total, end_sec: update_transcribe_job(
                 job_id,
                 progress=max(2, progress),
@@ -442,6 +459,9 @@ def transcribe_with_chunk_restart(
     selected_model: str,
     language: str,
     initial_prompt: str = "",
+    should_pause_cb=None,
+    pause_state_cb=None,
+    pause_heartbeat_cb=None,
     progress_cb=None,
     logger=None,
 ) -> dict:
@@ -505,12 +525,48 @@ def transcribe_with_chunk_restart(
     timed_segments = []
     detected_language: Optional[str] = None
 
+    def wait_if_paused(chunk_index: int, total_chunks: int, start_sec: float) -> None:
+        paused_announced = False
+        last_heartbeat_at = 0.0
+        while should_pause_cb and should_pause_cb():
+            now = time.time()
+            if not paused_announced:
+                paused_announced = True
+                if pause_state_cb:
+                    pause_state_cb(True)
+                if logger:
+                    logger(
+                        "info",
+                        (
+                            f"transcribe paused: chunk={chunk_index + 1}/{total_chunks}, "
+                            f"position={round(start_sec, 2)}s"
+                        ),
+                    )
+            if pause_heartbeat_cb and (now - last_heartbeat_at) >= 1.0:
+                pause_heartbeat_cb()
+                last_heartbeat_at = now
+            time.sleep(0.25)
+
+        if paused_announced:
+            if pause_state_cb:
+                pause_state_cb(False)
+            if logger:
+                logger(
+                    "info",
+                    (
+                        f"transcribe resumed: chunk={chunk_index + 1}/{total_chunks}, "
+                        f"position={round(start_sec, 2)}s"
+                    ),
+                )
+
     for chunk_index in range(total_chunks):
         start_sec = float(chunk_index * _TRANSCRIBE_CHUNK_SECONDS)
         remaining = max(0.0, total_duration - start_sec)
         duration_sec = chunk_size if remaining <= 0 else min(chunk_size, remaining)
         if duration_sec <= 0:
             break
+
+        wait_if_paused(chunk_index, total_chunks, start_sec)
 
         if logger:
             logger(
@@ -543,6 +599,7 @@ def transcribe_with_chunk_restart(
                 last_reported_progress = max(0, int(start_sec / total_duration * 100))
                 last_reported_time = start_sec
                 for seg in segments:
+                    wait_if_paused(chunk_index, total_chunks, start_sec + float(seg.start))
                     seg_end_overall = min(total_duration, start_sec + float(seg.end))
 
                     # Interpolate coarse segment boundaries into smoother pseudo progress updates.
@@ -778,13 +835,38 @@ def extract_text_from_docx(file_path: str) -> str:
         raise RuntimeError(f"Word ファイルのテキスト抽出に失敗しました: {str(exc)}")
 
 
+def extract_text_from_pptx(file_path: str) -> str:
+    """PowerPoint ファイル (.pptx) からテキストを抽出"""
+    if Presentation is None:
+        raise RuntimeError("python-pptx ライブラリが利用できません。")
+
+    try:
+        presentation = Presentation(file_path)
+        text_parts = []
+        for slide in presentation.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and str(shape.text).strip():
+                    text_parts.append(str(shape.text).strip())
+                if getattr(shape, "has_table", False):
+                    for row in shape.table.rows:
+                        for cell in row.cells:
+                            cell_text = (cell.text or "").strip()
+                            if cell_text:
+                                text_parts.append(cell_text)
+        return "\n".join(text_parts)
+    except Exception as exc:
+        raise RuntimeError(f"PowerPoint ファイルのテキスト抽出に失敗しました: {str(exc)}")
+
+
 def extract_text_from_resume(file_path: str, file_name: str) -> str:
-    """レジュメファイルからテキストを抽出（PDF or DOCX に対応）"""
+    """レジュメファイルからテキストを抽出（PDF / DOCX / PPTX に対応）"""
     file_lower = file_name.lower()
     if file_lower.endswith(".pdf"):
         return extract_text_from_pdf(file_path)
     elif file_lower.endswith(".docx"):
         return extract_text_from_docx(file_path)
+    elif file_lower.endswith(".pptx"):
+        return extract_text_from_pptx(file_path)
     else:
         raise RuntimeError(f"対応していないファイル形式です: {file_name}")
 
@@ -930,6 +1012,8 @@ def detect_resume_mime_type(filename: str) -> str:
         return "application/pdf"
     if lowered.endswith(".docx"):
         return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if lowered.endswith(".pptx"):
+        return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     return "application/octet-stream"
 
 
@@ -1203,6 +1287,8 @@ def get_transcribe_job_status(job_id: str) -> JSONResponse:
         "status": job["status"],
         "progress": job.get("progress", 0),
         "message": job.get("message", ""),
+        "pause_requested": bool(job.get("pause_requested", False)),
+        "updated_at": job.get("updated_at"),
         "model": job.get("model"),
         "language": job.get("language"),
     }
@@ -1215,18 +1301,55 @@ def get_transcribe_job_status(job_id: str) -> JSONResponse:
     return JSONResponse(response)
 
 
+@app.post("/api/transcribe/jobs/{job_id}/pause")
+def pause_transcribe_job(job_id: str) -> JSONResponse:
+    job = get_transcribe_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="ジョブが見つかりません。")
+
+    if job.get("status") in {"completed", "failed"}:
+        raise HTTPException(status_code=409, detail="完了済みジョブは一時停止できません。")
+
+    update_fields = {"pause_requested": True}
+    if job.get("status") == "running":
+        update_fields["status"] = "paused"
+        update_fields["message"] = "一時停止中です。"
+    update_transcribe_job(job_id, **update_fields)
+    add_debug_log("info", f"transcribe pause requested: job={job_id}")
+    return JSONResponse({"job_id": job_id, "pause_requested": True})
+
+
+@app.post("/api/transcribe/jobs/{job_id}/resume")
+def resume_transcribe_job(job_id: str) -> JSONResponse:
+    job = get_transcribe_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="ジョブが見つかりません。")
+
+    if job.get("status") in {"completed", "failed"}:
+        raise HTTPException(status_code=409, detail="完了済みジョブは再開できません。")
+
+    update_fields = {
+        "pause_requested": False,
+        "status": "running",
+        "message": "文字起こしを再開しました。",
+    }
+    update_transcribe_job(job_id, **update_fields)
+    add_debug_log("info", f"transcribe resume requested: job={job_id}")
+    return JSONResponse({"job_id": job_id, "pause_requested": False})
+
+
 @app.post("/api/extract-resume")
 async def extract_resume(file: UploadFile = File(...)) -> JSONResponse:
-    """レジュメファイル（PDF/DOCX）からテキストを抽出"""
+    """レジュメファイル（PDF/DOCX/PPTX）からテキストを抽出"""
     if not file.filename:
         raise HTTPException(status_code=400, detail="ファイルを選択してください。")
     
     # ファイル形式チェック
     file_lower = file.filename.lower()
-    if not (file_lower.endswith(".pdf") or file_lower.endswith(".docx")):
+    if not (file_lower.endswith(".pdf") or file_lower.endswith(".docx") or file_lower.endswith(".pptx")):
         raise HTTPException(
             status_code=400, 
-            detail="PDF または Word ファイル (.docx) のみ対応しています。"
+            detail="PDF / Word (.docx) / PowerPoint (.pptx) のみ対応しています。"
         )
     
     # 一時ファイルに保存
